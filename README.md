@@ -52,7 +52,7 @@
 
 - [yaml файл прошивки](charger.yaml)
 - [внешний вид](images/charger.jpg)
-- [Схема соединений](images/shema.jpeg)
+- [Схема соединений](images/shema.jpg)
 - [Видео YOUTUBE](https://youtu.be/gehCZNr6iQs)
 - [Видео RUTUBE](https://rutube.ru/video/cc3a3956d8b0eb6a3adb3e8a28c60828/)
 
