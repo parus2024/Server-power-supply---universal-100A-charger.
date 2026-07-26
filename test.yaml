@@ -1,0 +1,1010 @@
+substitutions:
+  name: charger
+  friendly_name: charger
+  friendly_name_short: charger
+  version: "17.07.2026"
+  device_ip: 192.168.0.219
+  reboot_timeout: 0s
+  dac_v_out_list: "14.5, 14.0, 13.5, 13.0, 12.0, 11.0, 10.0, 9.0, 8.0"
+  dac_v_pin_list: "1.00, 1.19, 1.32, 1.44, 1.62, 1.79, 1.96, 2.13, 2.35"
+  dac_vdd: "3.25"
+  dac_k_scale: "1.05"   # подобранное значение
+  success: scale_up:d=32,o=5,b=100:c,c#,d#,e,f#,g#,a#,b
+  short: short:d=4,o=5,b=100:16e6
+  pin_a: GPIO35
+  pin_b: GPIO34
+  encoder_button_pin: GPIO36
+  dac_output_pin: GPIO25
+  sda1: GPIO21
+  scl1: GPIO22
+  cs_pin: GPIO27
+  dc_pin: GPIO14
+  reset_pin: GPIO26
+  clk_pin: GPIO18 # (sck) 
+  miso_pin: GPIO19 # TFT(MISO)
+  mosi_pin: GPIO23 # TFT(MOSI)
+  backlight_pin: GPIO5 # LED яркость дисплея
+  rtttl_pin: GPIO13
+  one_wire_pin: GPIO15 # термометры DS18B20 (1-минус, 2 плюс 3,3в, 3- выход)
+
+<<: !include attach/common/esphome.yaml
+<<: !include attach/common/esp/wroom32_idf_chip3_1.yaml
+#<<: !include attach/common/logger/debug.yaml
+<<: !include attach/common/api.yaml
+<<: !include attach/common/ota.yaml
+<<: !include attach/common/wifi.yaml
+<<: !include attach/common/web/web_server3.yaml
+<<: !include attach/common/bus/i2c_a.yaml
+
+logger:
+  level: DEBUG               # общий уровень (чтобы остальное было видно)
+  logs:
+    sensor.energy_wh: WARN   # логи только для Energy Wh — только ошибки
+    sensor.power_sensor: WARN # логи только для Power Sensor — только ошибки
+packages:
+  common: !include attach/packages/standart.yaml
+time: 
+  platform: sntp
+  id: sntp_time
+  timezone: Europe/Moscow
+  servers:
+   - 0.ru.pool.ntp.org
+   - ntp0.ntp-servers.net
+   - 2.pool.ntp.org
+globals:
+  - id: cc_voltage_target
+    type: float
+    restore_value: yes
+    initial_value: "12.0"
+  - id: first_tick_after_on
+    type: bool
+    restore_value: no
+    initial_value: "true"
+  - id: charge_start_millis
+    type: unsigned long
+    restore_value: false
+    initial_value: '0'
+  - id: cc_cv_mode
+    type: int
+    restore_value: false
+    initial_value: '0'
+sensor:
+  - platform: ina219
+    address: 0x40
+#    shunt_resistance: 0.00025 ohm
+    shunt_resistance: 0.00000625 ohm
+    current:
+      name: "Current Sensor"
+      id: current_sensor
+      filters:
+        - delta: 0.05  # Игнорирует изменения меньше 0.05А
+        - calibrate_linear:
+           method: exact
+           datapoints:
+            - 0.8 -> 0.0
+            - 4.80 -> 4.40
+            - 7.70 -> 7.50
+            - 14.7 -> 15.0
+            - 23.0 -> 24.0
+            - 29.1 -> 31.0
+            - 35.7 -> 38.0
+        - lambda: |-
+            if (x < 0.8) return 0.0;
+            return x;
+    power:
+      name: "Power Sensor"
+      id: power_sensor
+    bus_voltage:
+      name: "Output Voltage"
+      id: output_voltage
+#    max_voltage: 32.0V
+    max_current: 100A
+    update_interval: 500ms
+
+# Encoder
+  - platform: rotary_encoder
+    name: "Encoder"
+    id: my_encoder
+    pin_a: 
+      number: ${pin_a}
+      inverted: false
+    pin_b:
+      number: ${pin_b}
+      inverted: false
+    min_value: 0
+    max_value: 100
+    resolution: 1
+    publish_initial_value: true
+    restore_mode: RESTORE_DEFAULT_ZERO
+    on_clockwise:
+      - if:
+          condition:
+            display_menu.is_active: my_menu
+          then:
+            - display_menu.down: my_menu
+    on_anticlockwise:
+      - if:
+          condition:
+            display_menu.is_active: my_menu
+          then:
+            - display_menu.up: my_menu
+         
+  - platform: integration
+    name: "Energy Wh"
+    id: energy_wh
+    sensor: power_sensor
+    unit_of_measurement: "Wh"
+    accuracy_decimals: 2
+    device_class: energy
+    time_unit: h
+    restore: true
+  - platform: integration
+    name: "Charge Ah"
+    id: charge_ah
+    sensor: current_sensor
+    unit_of_measurement: "Ah"
+    accuracy_decimals: 2
+    device_class: battery
+    time_unit: h
+    restore: true
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: ${encoder_button_pin} # Вход кнопки энкодера
+      inverted: true
+    name: "Encoder Button"
+    id: encoder_button
+    on_multi_click:
+    - timing: # Одиночное короткое нажатие
+        - ON for at most 1s
+        - OFF for at least 0.5s
+      then:
+        - if:
+            condition:
+              display.is_displaying_page: main_page
+            then:  
+              - switch.toggle: on_off
+            else:
+              - display_menu.enter: my_menu
+    - timing:  # Двойное нажатие
+        - ON for at most 1s
+        - OFF for at most 1s
+        - ON for at most 1s
+        - OFF for at least 0.2s
+      then:
+        - if:
+            condition:
+              lambda: 'return (!id(my_menu).is_active());'
+            then:
+              - display_menu.show_main: my_menu
+            else:
+              - display_menu.hide: my_menu
+              - display.page.show: main_page
+    - timing:  # Тройное нажатие -сброс счетчиков
+        - ON for at most 1s
+        - OFF for at most 1s
+        - ON for at most 1s
+        - OFF for at most 1s
+        - ON for at most 1s
+        - OFF for at least 0.2s
+      then:
+        - button.press: reset_counters_button
+  - platform: template
+    name: "Charging Finished"
+    id: charging_finished
+    device_class: "power"
+    trigger_on_initial_state: true
+    on_press:
+      then:
+        - rtttl.play: '${success}'  
+output:
+  - platform: esp32_dac
+    pin: ${dac_output_pin}
+    id: dac_output
+#    min_power: 0.2
+#    max_power: 0.75
+  - platform: ledc                                 # Подсветка дисплея
+    pin: ${backlight_pin}
+    id: backlight_pwm
+  - platform: ledc                                 # Зуммер
+    pin: ${rtttl_pin}
+    inverted: true
+    id: rtttl_out
+# Use the DAC output as a light
+light:
+  - platform: monochromatic
+    output: backlight_pwm                        #  Подсветка дисплея
+    name: "Display Backlight"
+    id: back_light
+    restore_mode: RESTORE_DEFAULT_ON
+switch:
+  - platform: gpio
+    name: On_Off
+    icon: mdi:power-cycle
+    id: on_off
+    pin:
+      number: GPIO12
+      inverted: false
+      mode:
+        output: true
+        pullup: true
+    on_turn_on:
+      - lambda: |-
+          // ============================================================
+          // ЛОКАЛЬНАЯ ФУНКЦИЯ РАСЧЁТА DAC (единая логика для всех мест)
+          // ============================================================
+          auto calc_dac_level = [&](float target_v) -> float {
+            static const float v_out[] = {${dac_v_out_list}};
+            static const float v_pin[] = {${dac_v_pin_list}};
+            const int n = 9;
+            const float vdd_a = ${dac_vdd}f;
+            // Используем substitution вместо отдельного number-компонента
+            const float k_scale = ${dac_k_scale}f; 
+
+            // Ограничиваем target_v диапазоном калибровочной таблицы
+            if (target_v < v_out[n-1]) target_v = v_out[n-1];
+            if (target_v > v_out[0])   target_v = v_out[0];
+
+            float dac_pin_voltage = 0.0f;
+            for (int i = 0; i < n - 1; i++) {
+              float v1 = v_out[i];
+              float v2 = v_out[i+1];
+              if (target_v >= v2 && target_v <= v1) {
+                float p1 = v_pin[i];
+                float p2 = v_pin[i+1];
+                float t = (target_v - v1) / (v2 - v1);
+                dac_pin_voltage = p1 + t * (p2 - p1);
+                break;
+              }
+            }
+
+            dac_pin_voltage *= k_scale;
+            float level = dac_pin_voltage / vdd_a;
+            return fmaxf(0.0f, fminf(1.0f, level));
+          };
+          // ============================================================
+
+          // Сбрасываем флаг завершения
+          id(charging_finished).publish_state(false);
+          ESP_LOGD("charge_ctrl", "Output ON: charging_finished_flag reset to false");
+
+          // Если авторежим зарядки — ставим флаг для мягкого старта в основном цикле
+          if (id(auto_charge_mode).state) {
+            id(first_tick_after_on) = true;
+            ESP_LOGD("auto_charge", "Output ON. First tick flag set to true.");
+          }
+          // Сбрасываем время старта при каждом включении
+          id(charge_start_millis) = millis();
+
+          // Сразу выставляем напряжение по текущему слайдеру
+          float target = id(desired_voltage_number).state;
+
+          // ВЫЗОВ ФУНКЦИИ РАСЧЁТА DAC
+          float level = calc_dac_level(target);
+          id(dac_output).set_level(level);
+
+          ESP_LOGD("on_turn_on", "Immediately set voltage from slider: %.2f V -> DAC level %.3f", target, level);
+
+    on_state:
+      - rtttl.play: '${short}'
+    restore_mode: ALWAYS_OFF
+  - platform: template
+    name: "Constant Current Mode"
+    id: cc_mode_switch
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - switch.turn_off: auto_charge_mode
+    on_state:
+      - rtttl.play: '${short}'
+  - platform: template
+    name: "Auto Charge Mode"
+    id: auto_charge_mode
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - switch.turn_off: cc_mode_switch
+    on_state:
+      - rtttl.play: '${short}'
+button:
+  - platform: template
+    name: "Reset Counters"
+    id: reset_counters_button
+    on_press:
+      - sensor.integration.reset: energy_wh
+      - sensor.integration.reset: charge_ah
+      - lambda: |-
+          // Сброс бинарника завершения при включении выхода
+          id(charging_finished).publish_state(false);
+          ESP_LOGD("charge_ctrl", "Output ON: charging_finished_flag reset to false");
+select:
+  - platform: template
+    name: "Battery Chemistry"
+    id: battery_chemistry
+    optimistic: true
+    options:
+      - "LiFePO4"
+      - "Li-Ion"
+    initial_option: "LiFePO4"
+    set_action:
+      - lambda: |-
+          if (x == "LiFePO4") {
+            ESP_LOGD("chem_sel", "Selected LiFePO4");
+          } else {
+            ESP_LOGD("chem_sel", "Selected Li-Ion");
+          }
+
+color:
+  - id: my_black
+    red: 0%
+    green: 0%
+    blue: 0%
+  - id: my_red
+    red: 100%
+    green: 0%
+    blue: 0%
+  - id: my_orange
+    red: 100%
+    green: 60%
+    blue: 0%
+  - id: my_yellow
+    red: 100%
+    green: 100%
+    blue: 0%
+  - id: my_green
+    red: 0%
+    green: 100%
+    blue: 0%
+  - id: my_blue
+    red: 50%
+    green: 50%
+    blue: 100%
+  - id: my_white
+    red: 100%
+    green: 100%
+    blue: 100%
+  - id: my_siren
+    red: 100%
+    green: 50%
+    blue: 100%
+  - id: my_cyan
+    hex: 00FFFF
+  - id: my_gray
+    red: 50%
+    green: 50%
+    blue: 50%
+
+font:
+  - file: "fonts/arial.ttf"
+    id: arial_24
+    size: 24
+    glyphs: |-
+      ~*<>!"%()+=,-_.:°0123456789АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯABCDEFGHIJKLMNOPQRSTUVWXYZ абвгдеёжзийклмнопрстуфхцчшщьыъэюяabcdefghijklmnopqrstuvwxyz'/
+  - file: "fonts/arial.ttf"
+    id: arial_18
+    size: 18
+    glyphs: |-
+      ~*<>!"%()+=,-_.:°0123456789АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯABCDEFGHIJKLMNOPQRSTUVWXYZ абвгдеёжзийклмнопрстуфхцчшщьыъэюяabcdefghijklmnopqrstuvwxyz'/
+  - file: "fonts/arial.ttf"
+    id: arial_14
+    size: 14
+    glyphs: |-
+      ~*<>!"%()+=,-_.:°0123456789АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯABCDEFGHIJKLMNOPQRSTUVWXYZ абвгдеёжзийклмнопрстуфхцчшщьыъэюяabcdefghijklmnopqrstuvwxyz'/
+spi:
+  clk_pin: ${clk_pin}
+  mosi_pin: ${mosi_pin}
+  miso_pin: ${miso_pin}
+
+display:
+  - platform: mipi_spi
+    model: ST7735
+    cs_pin: ${cs_pin}
+    dc_pin: ${dc_pin}
+    reset_pin: ${reset_pin}
+    invert_colors: false
+    show_test_card: false
+    id: my_display
+    rotation: 90
+    pages:
+      - id: main_page 
+        lambda: |-
+          // Мигание считаем тут, как ты и хотел (400 мс цикл)
+          uint32_t now = millis();
+          bool blink = ((now / 200) % 2) == 1;
+
+          // --- РАМКИ И ЛИНИИ (рисуем всегда, сверху вниз) ---
+          it.rectangle(0,  0, it.get_width(), it.get_height(), id(my_orange)); // рамка по периметру
+          it.rectangle(0, 12, it.get_width(), 48, id(my_orange));              // рамка блока данных
+          it.line(78, 0, 78, 60, id(my_orange));                               // вертикальная линия
+          it.line(0, 74, it.get_width(), 74, id(my_orange));                    // горизонтальная линия
+          it.line(0, 89, it.get_width(), 89, id(my_orange));                    // горизонтальная линия (ИСПРАВЛЕНО: id(...))
+
+          // Подписи колонок: «цель» и «выход»
+          it.printf(15, -3, id(arial_14), id(my_white), TextAlign::TOP_LEFT, "цель");
+          it.printf(100, -3, id(arial_14), id(my_white), TextAlign::TOP_LEFT, "выход");
+
+          // --- ХИМИЯ БАТАРЕИ (только если авторежим) ---
+          if (id(auto_charge_mode).state) {
+            const char* chem_text = (id(battery_chemistry).current_option() == "LiFePO4") ? "LiFePO4" : "Li-Ion";
+            it.print(5, 13, id(arial_18), id(my_yellow), TextAlign::TOP_LEFT, chem_text);
+          }
+
+          // --- ЦЕЛЕВОЕ НАПРЯЖЕНИЕ И ТОК (строго по твоей логике) ---
+
+          // Случай 1: ручной режим БП (нет CC и нет авто) — показываем целевое напряжение жёлтым, ток серым
+          if (!id(cc_mode_switch).state && !id(auto_charge_mode).state) {
+            it.printf(5, 12, id(arial_24), id(my_yellow), "%.1f", id(desired_voltage_number).state);
+            it.print(57, 12, id(arial_24), id(my_yellow), TextAlign::TOP_LEFT, "V");
+
+            it.printf(5, 33, id(arial_24), id(my_gray), "%.1f", id(target_current_number).state);
+            it.print(57, 33, id(arial_24), id(my_gray), TextAlign::TOP_LEFT, "A");
+          } 
+          // Случай 2: CC или Авто (включая LiFePO4/Li-Ion) — НЕ рисуем целевое напряжение вообще.
+          // Показываем только целевой ток жёлтым — этого достаточно, остальное видно справа.
+          else {
+            // Целевое напряжение НЕ рисуем — под LiFePO4 оно не нужно (справа есть реальное)
+
+            // Показываем целевой ток жёлтым
+            it.printf(5, 33, id(arial_24), id(my_yellow), "%.1f", id(target_current_number).state);
+            it.print(57, 33, id(arial_24), id(my_yellow), TextAlign::TOP_LEFT, "A");
+          }
+
+          // --- РЕАЛЬНЫЕ НАПРЯЖЕНИЕ И ТОК ---
+          // Если выход включён — белый цвет, иначе серый (чтобы было видно, что БП выключен)
+          if (id(on_off).state) {
+            it.printf(82, 12, id(arial_24), id(my_white), "%.2f", id(output_voltage).state);
+            it.print(141, 12, id(arial_24), id(my_white), TextAlign::TOP_LEFT, "V");
+
+            it.printf(82, 33, id(arial_24), id(my_white), "%.2f", id(current_sensor).state);
+            it.print(141, 33, id(arial_24), id(my_white), TextAlign::TOP_LEFT, "A");
+          } else {
+            it.printf(82, 12, id(arial_24), id(my_gray), "%.2f", id(output_voltage).state);
+            it.print(141, 12, id(arial_24), id(my_gray), TextAlign::TOP_LEFT, "V");
+
+            it.printf(82, 33, id(arial_24), id(my_gray), "%.2f", id(current_sensor).state);
+            it.print(141, 33, id(arial_24), id(my_gray), TextAlign::TOP_LEFT, "A");
+          }
+
+          // --- СООБЩЕНИЕ «ЗАРЯДКА ОКОНЧЕНА» (мигает, если флаг установлен) ---
+          if (id(charging_finished).state && blink) {
+            it.print(86, 12, id(arial_18), id(my_green), TextAlign::TOP_LEFT, "зарядка");
+            it.print(82, 33, id(arial_18), id(my_green), TextAlign::TOP_LEFT, "окончена");
+          }
+
+          // --- ЭНЕРГИЯ И ЗАРЯД (всегда жёлто-оранжевые) ---
+          it.printf(5, 60, id(arial_14), id(my_siren), "%.1fWh", id(energy_wh).state);
+          it.printf(90, 60, id(arial_14), id(my_siren), "%.1fAh", id(charge_ah).state);
+
+          // --- ИНДИКАТОР РЕЖИМА (внизу) ---
+          it.print(2, 74, id(arial_14), TextAlign::TOP_LEFT, "Режим:");
+          if (id(cc_mode_switch).state) {  
+            it.print(53, 74, id(arial_14), TextAlign::TOP_LEFT, "Поддержка тока");
+          } else if (id(auto_charge_mode).state) { 
+            it.print(57, 74, id(arial_14), TextAlign::TOP_LEFT, "Зарядка акку");
+          } else {
+            it.print(60, 74, id(arial_14), TextAlign::TOP_LEFT, "Блок питания");
+          }
+
+          // --- ПОДСКАЗКИ КНОПОК И ВРЕМЯ (самый низ) ---
+          it.print(5, 88, id(arial_14), id(my_white), TextAlign::TOP_LEFT, "Х1-вкл/выкл  Х2-меню");
+          it.print(5, 100, id(arial_14), id(my_white), TextAlign::TOP_LEFT, "Х3-сброс учета");
+
+          it.strftime(5, 112, id(arial_14), id(my_cyan), TextAlign::TOP_LEFT, "%H:%M", id(sntp_time).now());
+          it.printf(50, 112, id(arial_14), id(my_cyan), TextAlign::TOP_LEFT, "uptime: %s", id(uptime_human).state.c_str());
+
+
+graphical_display_menu:
+  id: my_menu
+  display: my_display
+  on_redraw:
+    then:
+      component.update: my_display
+  active: false
+  mode: rotary
+  font: arial_14
+  items:
+    - type: command
+      text: 'Выход из меню'
+      on_value:
+        then:
+          - display_menu.hide: my_menu
+    - type: switch
+      immediate_edit: false
+      text: 'Постоянный ток'
+      on_text: 'Вкл'
+      off_text: 'Выкл'
+      switch: cc_mode_switch
+    - type: switch
+      immediate_edit: false
+      text: 'Режим зарядки'
+      on_text: 'Вкл'
+      off_text: 'Выкл'
+      switch: auto_charge_mode
+    - type: number
+      text: 'Напряжение'
+      format: '%.1f'
+      number: desired_voltage_number
+    - type: number
+      text: 'Установка тока'
+      format: '%.1f'
+      number: target_current_number
+    - type: number
+      text: 'max cv voltage'
+      format: '%.1f'
+      number: max_cv_voltage
+    - type: select
+      immediate_edit: false
+      text: 'Вид батареи'
+      select: battery_chemistry
+    - type: command
+      text: 'Выход из меню'
+      on_value:
+        then:
+          - display_menu.hide: my_menu
+rtttl:
+  output: rtttl_out                              # Зуммер
+#  id: my_rtttl
+#  gain: 0.95
+
+number:
+  - platform: template
+    name: "Voltage"
+    id: desired_voltage_number
+    device_class: "voltage"
+    optimistic: true
+    min_value: 8.0
+    max_value: 14.5
+    step: 0.1
+    mode: box
+    unit_of_measurement: "V"
+    restore_value: true
+    set_action:
+      - lambda: |-
+          auto calc_dac_level = [&](float target_v) -> float {
+            static const float v_out[] = {${dac_v_out_list}};
+            static const float v_pin[] = {${dac_v_pin_list}};
+            const int n = 9;
+            const float vdd_a = ${dac_vdd}f;
+            const float k_scale = ${dac_k_scale}f;  // <-- подстановка вместо id(k_scale_number)
+
+            if (target_v < v_out[n-1]) target_v = v_out[n-1];
+            if (target_v > v_out[0])   target_v = v_out[0];
+
+            float dac_pin_voltage = 0.0f;
+            for (int i = 0; i < n - 1; i++) {
+              float v1 = v_out[i];
+              float v2 = v_out[i+1];
+              if (target_v >= v2 && target_v <= v1) {
+                float t = (target_v - v1) / (v2 - v1);
+                dac_pin_voltage = v_pin[i] + t * (v_pin[i+1] - v_pin[i]);
+                break;
+              }
+            }
+            dac_pin_voltage *= k_scale;
+            float level = dac_pin_voltage / vdd_a;
+            return fmaxf(0.0f, fminf(1.0f, level));
+          };
+
+          float target = x;
+          float level = calc_dac_level(target);
+          id(dac_output).set_level(level);
+
+          ESP_LOGD("dac_calib", "User set: %.2f V -> DAC level: %.3f", target, level);
+  - platform: template
+    name: "Max CV Voltage"
+    id: max_cv_voltage
+    unit_of_measurement: "V"
+    restore_value: true
+    optimistic: true
+    min_value: 12.0
+    max_value: 14.5
+    step: 0.05
+    mode: box
+  - platform: template
+    name: "Target Current"
+    id: target_current_number
+    restore_value: true
+    optimistic: true
+    min_value: 1.0          # Минимальный осмысленный ток
+    max_value: 85.0
+    step: 0.1 
+    mode: box
+    unit_of_measurement: "A"
+
+interval:
+  - interval: 300ms
+    then:
+      - if:
+          condition:
+            - lambda: 'return id(cc_mode_switch).state && !id(auto_charge_mode).state && id(on_off).state;'
+          then:
+            - lambda: |-
+                // ============================================================
+                // ЛОКАЛЬНАЯ ФУНКЦИЯ РАСЧЁТА DAC (единая логика для всех мест)
+                // ============================================================
+                auto calc_dac_level = [&](float target_v) -> float {
+                  static const float v_out[] = {${dac_v_out_list}};
+                  static const float v_pin[] = {${dac_v_pin_list}};
+                  const int n = 9;
+                  const float vdd_a = ${dac_vdd}f;
+                  // Используем substitution вместо отдельного number-компонента
+                  const float k_scale = ${dac_k_scale}f; 
+
+                  // Ограничиваем target_v диапазоном калибровочной таблицы
+                  if (target_v < v_out[n-1]) target_v = v_out[n-1];
+                  if (target_v > v_out[0])   target_v = v_out[0];
+
+                  float dac_pin_voltage = 0.0f;
+                  for (int i = 0; i < n - 1; i++) {
+                    float v1 = v_out[i];
+                    float v2 = v_out[i+1];
+                    if (target_v >= v2 && target_v <= v1) {
+                      float p1 = v_pin[i];
+                      float p2 = v_pin[i+1];
+                      float t = (target_v - v1) / (v2 - v1);
+                      dac_pin_voltage = p1 + t * (p2 - p1);
+                      break;
+                    }
+                  }
+
+                  dac_pin_voltage *= k_scale;
+                  float level = dac_pin_voltage / vdd_a;
+                  return fmaxf(0.0f, fminf(1.0f, level));
+                };
+                // ============================================================
+
+                // --- ЛОГИКА ПИ-РЕГУЛЯТОРА (CC MODE) ---
+                float target_i = id(target_current_number).state;
+                float current = id(current_sensor).state;
+                float error = target_i - current;
+
+                // DEADBAND: порог, ниже которого не трогаем выход.
+                // Если ошибка < 0.05 А — считаем, что ток уже на цели.
+                if (fabs(error) < 0.05) {
+                  return;
+                }
+
+                // KP (пропорциональный коэффициент): скорость реакции регулятора.
+                float kp = 0.1;
+                float voltage_step = error * kp;
+
+                // MAX_STEP: максимальный шаг изменения напряжения за один цикл (в вольтах).
+                float max_step = 0.01;
+                if (voltage_step > max_step) voltage_step = max_step;
+                if (voltage_step < -max_step) voltage_step = -max_step;
+
+                // Обновляем внутреннее целевое напряжение (хранится в globals)
+                float new_v = id(cc_voltage_target) + voltage_step;
+
+                // Ограничиваем диапазон напряжения БП (8.0–14.5 В)
+                if (new_v < 8.0) new_v = 8.0;
+                if (new_v > 14.5) new_v = 14.5;
+                id(cc_voltage_target) = new_v;
+
+                // Округляем до 1 знака после запятой, чтобы в HA было чисто и без «мусора»
+                float rounded_v = roundf(new_v * 10.0f) / 10.0f;
+
+                // Двигаем ползунок Voltage в HA через API
+                // publish_state просто обновляет отображаемое значение, не запуская set_action
+                id(desired_voltage_number).publish_state(rounded_v);
+
+                // ВЫЗОВ ФУНКЦИИ РАСЧЁТА DAC (вместо 20 строк математики)
+                float level = calc_dac_level(rounded_v);
+                id(dac_output).set_level(level);
+
+                ESP_LOGD("cc_loop", "I_target=%.2f A, I_real=%.2f A, Err=%.2f A, V_step=%.3f V, V_target=%.1f V",
+                         target_i, current, error, voltage_step, rounded_v);
+
+  - interval: 500ms
+    then:
+      - if:
+          condition:
+            - lambda: 'return !id(cc_mode_switch).state && id(auto_charge_mode).state && id(on_off).state;'
+          then:
+            - lambda: |-
+                // ============================================================
+                // ЛОКАЛЬНАЯ ФУНКЦИЯ РАСЧЁТА DAC
+                // ============================================================
+                auto calc_dac_level = [&](float target_v) -> float {
+                  static const float v_out[] = {${dac_v_out_list}};
+                  static const float v_pin[] = {${dac_v_pin_list}};
+                  const int n = 9;
+                  const float vdd_a = ${dac_vdd}f;
+                  const float k_scale = ${dac_k_scale}f; 
+
+                  if (target_v < v_out[n-1]) target_v = v_out[n-1];
+                  if (target_v > v_out[0])   target_v = v_out[0];
+
+                  float dac_pin_voltage = 0.0f;
+                  for (int i = 0; i < n - 1; i++) {
+                    float v1 = v_out[i];
+                    float v2 = v_out[i+1];
+                    if (target_v >= v2 && target_v <= v1) {
+                      float p1 = v_pin[i];
+                      float p2 = v_pin[i+1];
+                      float t = (target_v - v1) / (v2 - v1);
+                      dac_pin_voltage = p1 + t * (p2 - p1);
+                      break;
+                    }
+                  }
+
+                  dac_pin_voltage *= k_scale;
+                  float level = dac_pin_voltage / vdd_a;
+                  return fmaxf(0.0f, fminf(1.0f, level));
+                };
+
+                // ============================================================
+                // ЧТЕНИЕ ВХОДОВ И НАСТРОЕК
+                // ============================================================
+                float target_i = id(target_current_number).state;
+                float current = id(current_sensor).state;
+                float bat_v = id(output_voltage).state;
+                bool output_enabled = id(on_off).state;
+                std::string chem = id(battery_chemistry).current_option();
+
+                float user_limit = id(max_cv_voltage).state;
+                const float hard_max = 14.5f;
+                float cv_threshold = (user_limit > hard_max) ? hard_max : user_limit;
+
+                ESP_LOGD("auto_charge", "CV Threshold: user=%.2f V, effective=%.2f V", user_limit, cv_threshold);
+
+                // ============================================================
+                // МЯГКИЙ СТАРТ (только первый тик)
+                // ============================================================
+                if (id(first_tick_after_on)) {
+                  id(cc_cv_mode) = 0; // сброс в CC
+
+                  float soft_start_v = bat_v + 0.05f;
+                  if (soft_start_v > cv_threshold) soft_start_v = cv_threshold;
+                  if (soft_start_v < 8.0f) soft_start_v = 8.0f;
+
+                  id(cc_voltage_target) = soft_start_v;
+                  float rounded_v = roundf(soft_start_v * 10.0f) / 10.0f;
+                  id(desired_voltage_number).publish_state(rounded_v);
+
+                  float level = calc_dac_level(soft_start_v);
+                  id(dac_output).set_level(level);
+
+                  ESP_LOGD("auto_charge", "FIRST TICK SOFT START: Bat=%.2f V -> Set=%.1f V, Chem=%s, CV_Thresh=%.2f V",
+                           bat_v, rounded_v, chem.c_str(), cv_threshold);
+
+                  id(first_tick_after_on) = false;
+                  id(charge_start_millis) = millis();
+                  return;
+                }
+
+                // ============================================================
+                // ЗАЩИТА ОТ «НЕТ НАГРУЗКИ»
+                // ============================================================
+                if (output_enabled) {
+                  const float no_load_threshold = 0.15f;
+                  if (current < no_load_threshold && bat_v >= (cv_threshold - 0.05f)) {
+                    ESP_LOGD("auto_charge", "!!! NO LOAD DETECTED !!! I=%.3f A, V=%.2f V. Turning OFF output.", current, bat_v);
+                    id(on_off).turn_off();
+                    id(charging_finished).publish_state(true);
+                    return;
+                  }
+                }
+
+                // ============================================================
+                // ПЕРЕКЛЮЧЕНИЕ CC -> CV
+                // ============================================================
+                //if (id(cc_cv_mode) == 0 && bat_v >= cv_threshold) {
+                //  id(cc_cv_mode) = 1;
+                //  ESP_LOGD("auto_charge", "CC->CV: BatV=%.2f >= Threshold=%.2f. Switched to CV mode.", bat_v, cv_threshold);
+                //}
+
+                // перед переключением CC->CV: считаем время удержания порога
+                static unsigned long cv_hold_start = 0xFFFFFFFFUL;
+                const unsigned long cv_hold_ms = 60000UL; // 60 секунд
+
+                if (id(cc_cv_mode) == 0) {
+                  if (bat_v >= cv_threshold && current < target_i) {
+                    if (cv_hold_start == 0xFFFFFFFFUL) cv_hold_start = millis();
+                    if ((millis() - cv_hold_start) >= cv_hold_ms) {
+                      id(cc_cv_mode) = 1;
+                      cv_hold_start = 0xFFFFFFFFUL;
+                      ESP_LOGD("auto_charge", "CC->CV after hold: BatV=%.2f, I=%.2f", bat_v, current);
+                    }
+                  } else {
+                    cv_hold_start = 0xFFFFFFFFUL; // сброс, если условие не держится
+                  }
+                } else { // CV режим
+                  if (current > target_i) { // если ток снова вырос — обратно в CC
+                    id(cc_cv_mode) = 0;
+                    ESP_LOGD("auto_charge", "CV->CC: I=%.2f > target=%.1f", current, target_i);
+                  }
+                }
+
+                // ============================================================
+                // ПИ-РЕГУЛЯТОР: CC И CV
+                // ============================================================
+                float new_v = id(cc_voltage_target);
+
+                if (id(cc_cv_mode) == 0) {
+                  // --- РЕЖИМ CC: держим целевой ток ---
+                  float error = target_i - current;
+
+                  if (fabs(error) >= 0.1f) {
+                    float kp = 0.2f;          
+                    float max_step = 0.1f;   
+
+                    float voltage_step = error * kp;
+                    if (voltage_step > max_step) voltage_step = max_step;
+                    if (voltage_step < -max_step) voltage_step = -max_step;
+
+                    new_v = id(cc_voltage_target) + voltage_step;
+
+                    if (new_v > cv_threshold) new_v = cv_threshold;
+                    if (new_v < 8.0f) new_v = 8.0f;
+
+                    id(cc_voltage_target) = new_v;
+
+                    float rounded_v = roundf(new_v * 10.0f) / 10.0f;
+                    id(desired_voltage_number).publish_state(rounded_v);
+
+                    float level = calc_dac_level(new_v);
+                    id(dac_output).set_level(level);
+                  } else {
+                    float rounded_v = roundf(new_v * 10.0f) / 10.0f;
+                    id(desired_voltage_number).publish_state(rounded_v);
+                  }
+                } 
+                else {
+                  // --- РЕЖИМ CV: держим целевое напряжение ---
+                  float target_v = cv_threshold;
+                  float voltage_error = target_v - bat_v;
+
+                  if (fabs(voltage_error) >= 0.02f) {
+                    float kp_v = 0.2f;       
+                    float max_step_v = 0.01f;
+
+                    float voltage_step = voltage_error * kp_v;
+                    if (voltage_step > max_step_v) voltage_step = max_step_v;
+                    if (voltage_step < -max_step_v) voltage_step = -max_step_v;
+
+                    new_v = id(cc_voltage_target) + voltage_step;
+
+                    if (new_v > cv_threshold) new_v = cv_threshold;
+                    if (new_v < 8.0f) new_v = 8.0f;
+
+                    id(cc_voltage_target) = new_v;
+
+                    float rounded_v = roundf(new_v * 10.0f) / 10.0f;
+                    id(desired_voltage_number).publish_state(rounded_v);
+
+                    float level = calc_dac_level(new_v);
+                    id(dac_output).set_level(level);
+                  } else {
+                    float rounded_v = roundf(new_v * 10.0f) / 10.0f;
+                    id(desired_voltage_number).publish_state(rounded_v);
+                  }
+                }
+
+                // ============================================================
+                // ПРОВЕРКА ЗАВЕРШЕНИЯ ЗАРЯДКИ
+                // ============================================================
+                float stop_threshold = target_i * 0.01f;
+                if (stop_threshold < 0.1f) stop_threshold = 0.1f;
+
+                unsigned long now_ms = millis();
+                unsigned long start_ms = id(charge_start_millis);
+                unsigned long time_since_start = now_ms - start_ms;
+
+                static unsigned long low_current_start_ms = 0xFFFFFFFFUL;
+
+                bool is_low_current = (id(cc_cv_mode) == 1 && current < stop_threshold);
+
+                if (is_low_current) {
+                  if (low_current_start_ms == 0xFFFFFFFFUL) {
+                    low_current_start_ms = now_ms;
+                  }
+                } else {
+                  low_current_start_ms = 0xFFFFFFFFUL;
+                }
+
+                const unsigned long min_startup_ms = 1500UL;
+                const unsigned long low_current_hold_ms = 1000UL;
+
+                bool finished = false;
+
+                if (time_since_start >= min_startup_ms && low_current_start_ms != 0xFFFFFFFFUL) {
+                  unsigned long low_duration = now_ms - low_current_start_ms;
+                  if (low_duration >= low_current_hold_ms) {
+                    finished = true;
+                  }
+                }
+
+                id(charging_finished).publish_state(finished);
+
+                if (finished) {
+                  id(on_off).turn_off();
+                  ESP_LOGD("auto_charge", "FINISHED: I_tgt=%.1f A, I_real=%.2f A, threshold=%.2f A, since_start=%lu ms, low_dur=%lu ms",
+                           target_i, current, stop_threshold, time_since_start, now_ms - low_current_start_ms);
+                } else {
+                  const char* mode_str = (id(cc_cv_mode) == 0 ? "CC" : "CV");
+                  ESP_LOGD("auto_charge", "%s: Chem=%s, I_tgt=%.1f A, I_real=%.2f A, V_tgt=%.2f V, since_start=%lu ms, mode=%s",
+                           mode_str,
+                           chem.c_str(),
+                           target_i,
+                           current,
+                           new_v,
+                           time_since_start,
+                           mode_str);
+                }
+
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            - lambda: |-
+                return id(auto_charge_mode).state && !id(on_off).state;
+          then:
+            - lambda: |-
+                // ============================================================
+                // ЛОКАЛЬНАЯ ФУНКЦИЯ РАСЧЁТА DAC (единая логика для всех мест)
+                // ============================================================
+                auto calc_dac_level = [&](float target_v) -> float {
+                  static const float v_out[] = {${dac_v_out_list}};
+                  static const float v_pin[] = {${dac_v_pin_list}};
+                  const int n = 9;
+                  const float vdd_a = ${dac_vdd}f;
+                  // Используем substitution вместо отдельного number-компонента
+                  const float k_scale = ${dac_k_scale}f; 
+
+                  // Ограничиваем target_v диапазоном калибровочной таблицы
+                  if (target_v < v_out[n-1]) target_v = v_out[n-1];
+                  if (target_v > v_out[0])   target_v = v_out[0];
+
+                  float dac_pin_voltage = 0.0f;
+                  for (int i = 0; i < n - 1; i++) {
+                    float v1 = v_out[i];
+                    float v2 = v_out[i+1];
+                    if (target_v >= v2 && target_v <= v1) {
+                      float p1 = v_pin[i];
+                      float p2 = v_pin[i+1];
+                      float t = (target_v - v1) / (v2 - v1);
+                      dac_pin_voltage = p1 + t * (p2 - p1);
+                      break;
+                    }
+                  }
+
+                  dac_pin_voltage *= k_scale;
+                  float level = dac_pin_voltage / vdd_a;
+                  return fmaxf(0.0f, fminf(1.0f, level));
+                };
+                // ============================================================
+
+                float bat_v = id(output_voltage).state;
+                float target_v = bat_v + 0.1f;
+
+                // Ограничиваем по химии
+                float v_max = 14.8f;
+                std::string chem = id(battery_chemistry).current_option();
+                if (chem == "LiFePO4") {
+                  v_max = 14.4f;
+                } else if (chem == "Li-Ion") {
+                  v_max = 12.6f;
+                }
+
+                if (target_v > v_max) target_v = v_max;
+                if (target_v < 8.0f) target_v = 8.0f;
+
+                float rounded_v = roundf(target_v * 10.0f) / 10.0f;
+
+                // Сравниваем с текущим целевым: если разница > 0.1 В — обновляем
+                float current_target = id(cc_voltage_target);
+                if (fabs(current_target - rounded_v) > 0.1f) {
+                  id(cc_voltage_target) = rounded_v;
+                  id(desired_voltage_number).publish_state(rounded_v);
+
+                  // ВЫЗОВ ФУНКЦИИ РАСЧЁТА DAC
+                  float level = calc_dac_level(rounded_v);
+                  id(dac_output).set_level(level);
+
+                  ESP_LOGD("pre_start", "Pre-start updated: Bat=%.2f V -> Target=%.1f V, diff=%.2f V",
+                           bat_v, rounded_v, fabs(current_target - rounded_v));
+                } else {
+                  // ESP_LOGD("pre_start", "No update: Target already close enough (%.1f vs %.1f)", current_target, rounded_v);
+                }
